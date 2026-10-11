@@ -5,6 +5,7 @@ import hudson.model.Action;
 import hudson.model.Actionable;
 import hudson.model.InvisibleAction;
 import hudson.model.Queue;
+import hudson.model.Run;
 import hudson.model.queue.FoldableAction;
 import java.util.ArrayList;
 import java.util.List;
@@ -35,10 +36,29 @@ class BuildTriggerAction extends InvisibleAction implements FoldableAction {
         @CheckForNull
         Throwable interruption;
 
+        /**
+         * The upstream build and its {@code build} step's node, so that the outcome can be delivered to whichever
+         * controller runs the upstream build when the downstream build ran on another (cloud-native Jenkins). Null in
+         * records written before.
+         */
+        @CheckForNull
+        final String upstreamJob;
+        final int upstreamNumber;
+        @CheckForNull
+        final String nodeId;
+
         Trigger(StepContext context, boolean propagate, boolean waitForStart) {
+            this(context, propagate, waitForStart, null, 0, null);
+        }
+
+        Trigger(StepContext context, boolean propagate, boolean waitForStart, @CheckForNull String upstreamJob, int upstreamNumber,
+                @CheckForNull String nodeId) {
             this.context = context;
             this.propagate = propagate;
             this.waitForStart = waitForStart;
+            this.upstreamJob = upstreamJob;
+            this.upstreamNumber = upstreamNumber;
+            this.nodeId = nodeId;
         }
 
     }
@@ -48,6 +68,11 @@ class BuildTriggerAction extends InvisibleAction implements FoldableAction {
     BuildTriggerAction(StepContext context, boolean propagate, boolean waitForStart) {
         triggers = new ArrayList<>();
         triggers.add(new Trigger(context, propagate, waitForStart));
+    }
+
+    BuildTriggerAction(StepContext context, boolean propagate, boolean waitForStart, Run<?, ?> upstream, String nodeId) {
+        triggers = new ArrayList<>();
+        triggers.add(new Trigger(context, propagate, waitForStart, upstream.getParent().getFullName(), upstream.getNumber(), nodeId));
     }
 
     private Object readResolve() {

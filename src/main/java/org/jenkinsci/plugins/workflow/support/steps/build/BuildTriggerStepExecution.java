@@ -31,6 +31,7 @@ import hudson.model.queue.Tasks;
 import hudson.security.AccessControlled;
 import jenkins.model.Jenkins;
 import jenkins.model.ParameterizedJobMixIn;
+import jenkins.persistence.RunningBuilds;
 import org.springframework.security.core.Authentication;
 import org.jenkinsci.plugins.workflow.actions.LabelAction;
 import org.jenkinsci.plugins.workflow.graph.FlowNode;
@@ -99,7 +100,7 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
 
             if (step.getWait() || step.getWaitForStart()) {
                 StepContext context = getContext();
-                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart()));
+                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart(), upstream, node.getId()));
                 LOGGER.log(Level.FINER, "scheduling a build of {0} from {1}", new Object[]{project, context});
             }
 
@@ -129,7 +130,7 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
 
             if (step.getWait() || step.getWaitForStart()) {
                 StepContext context = getContext();
-                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart()));
+                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart(), upstream, node.getId()));
                 LOGGER.log(Level.FINER, "scheduling a build of {0} from {1}", new Object[]{task, context});
             }
 
@@ -252,6 +253,22 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
             }
             for (Executor e : c.getOneOffExecutors()) {
                 interrupted |= maybeInterrupt(e, cause, context);
+            }
+        }
+
+        // cloud-native Jenkins: a downstream build running on another controller is stopped there; its outcome is
+        // delivered back here (BuildTriggerDelivery)
+        Run<?, ?> upstream = context.get(Run.class);
+        FlowNode node = context.get(FlowNode.class);
+        DownstreamBuildAction downstreams = upstream == null ? null : upstream.getAction(DownstreamBuildAction.class);
+        if (downstreams != null && node != null) {
+            for (DownstreamBuildAction.DownstreamBuild db : downstreams.getDownstreamBuilds()) {
+                Integer number = db.getBuildNumber();
+                Job<?, ?> job = number == null || !db.getFlowNodeId().equals(node.getId()) ? null : jenkins.getItemByFullName(db.getJobFullName(), Job.class);
+                if (job != null && job.getBuildByNumber(number) == null && cancelPermitted(job, job.getFullDisplayName(), context)) {
+                    RunningBuilds.requestStop(job, number, "the build step of " + upstream.getFullDisplayName());
+                    interrupted = true;
+                }
             }
         }
 
