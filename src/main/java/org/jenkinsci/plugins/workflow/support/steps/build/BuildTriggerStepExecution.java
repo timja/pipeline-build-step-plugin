@@ -32,7 +32,16 @@ import hudson.security.AccessControlled;
 import jenkins.model.Jenkins;
 import jenkins.model.ParameterizedJobMixIn;
 import org.springframework.security.core.Authentication;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.Beta;
+import hudson.security.ACL;
+import hudson.security.ACLContext;
 import org.jenkinsci.plugins.workflow.actions.LabelAction;
+import org.jenkinsci.plugins.workflow.actions.WarningAction;
+import org.jenkinsci.plugins.workflow.flow.FlowExecution;
+import org.jenkinsci.plugins.workflow.flow.FlowExecutionOwner;
+import org.jenkinsci.plugins.workflow.steps.FlowInterruptedException;
+import org.jenkinsci.plugins.workflow.steps.StepExecution;
 import org.jenkinsci.plugins.workflow.graph.FlowNode;
 import org.jenkinsci.plugins.workflow.steps.AbstractStepExecutionImpl;
 import org.jenkinsci.plugins.workflow.steps.StepContext;
@@ -45,6 +54,9 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -60,9 +72,13 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
 
     private final transient BuildTriggerStep step;
 
+    /** As {@link BuildTriggerStep#isPropagate}, for an outcome {@linkplain #deliver delivered} after a restart. */
+    private final boolean propagate;
+
     public BuildTriggerStepExecution(BuildTriggerStep step, @NonNull StepContext context) {
         super(context);
         this.step = step;
+        this.propagate = step.isPropagate();
     }
 
     @SuppressWarnings({"unchecked", "rawtypes"}) // cannot get from ParameterizedJob back to ParameterizedJobMixIn trivially
@@ -99,7 +115,7 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
 
             if (step.getWait() || step.getWaitForStart()) {
                 StepContext context = getContext();
-                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart()));
+                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart(), returnAddress(upstream, node)));
                 LOGGER.log(Level.FINER, "scheduling a build of {0} from {1}", new Object[]{project, context});
             }
 
@@ -129,7 +145,7 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
 
             if (step.getWait() || step.getWaitForStart()) {
                 StepContext context = getContext();
-                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart()));
+                actions.add(new BuildTriggerAction(context, step.isPropagate(), step.getWaitForStart(), returnAddress(upstream, node)));
                 LOGGER.log(Level.FINER, "scheduling a build of {0} from {1}", new Object[]{task, context});
             }
 
@@ -255,9 +271,129 @@ public class BuildTriggerStepExecution extends AbstractStepExecutionImpl {
             }
         }
 
+        // a downstream build running on another controller is stopped there; its outcome is relayed back
+        BuildTriggerRelay relay = BuildTriggerRelay.get();
+        Run<?, ?> upstream = context.get(Run.class);
+        FlowNode node = context.get(FlowNode.class);
+        DownstreamBuildAction downstreams = relay == null || upstream == null ? null : upstream.getAction(DownstreamBuildAction.class);
+        if (downstreams != null && node != null) {
+            for (DownstreamBuildAction.DownstreamBuild db : downstreams.getDownstreamBuilds()) {
+                Integer number = db.getBuildNumber();
+                if (number == null || !db.getFlowNodeId().equals(node.getId())) {
+                    continue;
+                }
+                Job<?, ?> job = jenkins.getItemByFullName(db.getJobFullName(), Job.class);
+                Run<?, ?> local = job == null ? null : job.getBuildByNumber(number);
+                if (job != null && (local == null || !local.isBuilding())
+                        && cancelPermitted(job, job.getFullDisplayName(), context)
+                        && relay.requestStop(job, number, "the build step of " + upstream.getFullDisplayName())) {
+                    interrupted = true;
+                }
+            }
+        }
+
         if (!interrupted) {
             super.stop(cause);
         }
+    }
+
+    private static @CheckForNull String returnAddress(Run<?, ?> upstream, FlowNode node) {
+        BuildTriggerRelay relay = BuildTriggerRelay.get();
+        return relay == null ? null : relay.returnAddress(upstream, node.getId());
+    }
+
+    /**
+     * Completes a {@code build} step with an event of its downstream build relayed from another controller
+     * ({@link BuildTriggerRelay}), as {@link BuildTriggerListener} does when both builds run here. Delivering an
+     * event again is harmless.
+     *
+     * @param upstream the build running the step, on this controller
+     * @param nodeId the step's flow node
+     * @param event what happened to the downstream build
+     * @param downstreamExternalizableId the downstream build's {@link Run#getExternalizableId}
+     * @param result the downstream build's result, for {@link BuildTriggerRelay.Event#COMPLETED}
+     * @param waitForStart whether the step waits only for the downstream build to start
+     * @return true if handled (the step completed, or is no longer waiting); false if not possible yet, so the caller
+     *     is to deliver it again later: the upstream build is not resumed yet, or the downstream build of a successful
+     *     outcome is not loaded here yet
+     */
+    @Restricted(Beta.class)
+    public static boolean deliver(@NonNull Run<?, ?> upstream, @NonNull String nodeId, @NonNull BuildTriggerRelay.Event event,
+            @NonNull String downstreamExternalizableId, @CheckForNull Result result, boolean waitForStart)
+            throws IOException, InterruptedException {
+        if (!(upstream instanceof FlowExecutionOwner.Executable executable)) {
+            return true; // nothing to complete
+        }
+        FlowExecutionOwner owner = executable.asFlowExecutionOwner();
+        FlowExecution execution = owner == null ? null : owner.getOrNull();
+        if (execution == null) {
+            return false; // not resumed yet
+        }
+        if (execution.isComplete()) {
+            return true;
+        }
+        BuildTriggerStepExecution step = null;
+        try {
+            for (StepExecution se : execution.getCurrentExecutions(true).get(10, TimeUnit.SECONDS)) {
+                if (se instanceof BuildTriggerStepExecution bt && nodeId.equals(bt.getContext().get(FlowNode.class).getId())) {
+                    step = bt;
+                }
+            }
+        } catch (ExecutionException | TimeoutException x) {
+            LOGGER.log(Level.FINE, "Could not list the steps of " + upstream, x);
+            return false;
+        }
+        if (step == null) {
+            return true; // completed already (delivered twice), or stopped
+        }
+        StepContext context = step.getContext();
+        try (ACLContext ignored = ACL.as2(ACL.SYSTEM2)) {
+            int hash = downstreamExternalizableId.lastIndexOf('#');
+            String jobName = hash < 0 ? downstreamExternalizableId : downstreamExternalizableId.substring(0, hash);
+            int number = hash < 0 ? 0 : Integer.parseInt(downstreamExternalizableId.substring(hash + 1));
+            Job<?, ?> job = Jenkins.get().getItemByFullName(jobName, Job.class);
+            Run<?, ?> downstream = job == null ? null : job.getBuildByNumber(number);
+            String link = ModelHyperlinkNote.encodeTo("/" + (job == null ? "" : job.getUrl() + number + "/"), jobName + " #" + number);
+            TaskListener listener = context.get(TaskListener.class);
+            switch (event) {
+                case STARTED -> {
+                    listener.getLogger().println("Starting building: " + link);
+                    if (job != null) {
+                        DownstreamBuildAction.getOrCreate(upstream, nodeId, job).setBuildNumber(number);
+                        upstream.save();
+                    }
+                    if (waitForStart) {
+                        if (downstream != null) {
+                            context.onSuccess(new RunWrapper(downstream, false));
+                        } else {
+                            context.onFailure(new AbortException(jobName + " #" + number
+                                    + " started on another controller, so it cannot be returned to waitForStart here"));
+                        }
+                    }
+                }
+                case COMPLETED -> {
+                    if (waitForStart) {
+                        return true; // completed when it started
+                    }
+                    Result r = result == null ? Result.FAILURE : result;
+                    if (step.propagate && r != Result.SUCCESS) {
+                        listener.getLogger().println("Build " + link + " completed: " + r);
+                        context.get(FlowNode.class).addOrReplaceAction(new WarningAction(r));
+                        context.onFailure(new FlowInterruptedException(r, false, downstream != null
+                                ? new DownstreamFailureCause(downstream)
+                                : new DownstreamFailureCause(jobName, number, job == null ? "" : job.getUrl() + number + "/", r)));
+                    } else if (downstream == null) {
+                        return false; // returned once its record is here
+                    } else {
+                        listener.getLogger().println("Build " + link + " completed: " + r);
+                        context.onSuccess(new RunWrapper(downstream, false));
+                    }
+                }
+                case DELETED -> context.onFailure(new AbortException(jobName + " #" + number + " was deleted"));
+                default -> throw new IllegalArgumentException(event.toString());
+            }
+        }
+        return true;
     }
     private static boolean maybeInterrupt(Executor e, Throwable cause, StepContext context) {
         boolean interrupted = false;
