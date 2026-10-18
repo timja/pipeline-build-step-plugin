@@ -55,6 +55,14 @@ public final class DownstreamFailureCause extends CauseOfInterruption {
         result = downstream.getResult();
     }
 
+    /** For a downstream build that is not loaded on this controller. */
+    DownstreamFailureCause(String jobFullName, int buildNumber, String url, Result result) {
+        this.jobFullName = jobFullName;
+        this.buildNumber = buildNumber;
+        this.url = url;
+        this.result = result;
+    }
+
     public @CheckForNull Run<?, ?> getDownstreamBuild() {
         if (id != null) {
             return Run.fromExternalizableId(id);

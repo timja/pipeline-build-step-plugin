@@ -85,6 +85,11 @@ public final class DownstreamBuildAction extends InvisibleAction {
             return Run.fromExternalizableId(jobFullName + '#' + buildNumber);
         }
 
+        /** For a downstream build that runs on another controller and is not loaded here. */
+        void setBuildNumber(int number) {
+            this.buildNumber = number;
+        }
+
         void setBuild(@NonNull Run<?, ?> run) {
             this.buildNumber = run.getNumber();
         }

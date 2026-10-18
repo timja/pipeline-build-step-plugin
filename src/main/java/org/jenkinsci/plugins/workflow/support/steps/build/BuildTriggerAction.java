@@ -5,6 +5,7 @@ import hudson.model.Action;
 import hudson.model.Actionable;
 import hudson.model.InvisibleAction;
 import hudson.model.Queue;
+import hudson.model.Run;
 import hudson.model.queue.FoldableAction;
 import java.util.ArrayList;
 import java.util.List;
@@ -35,10 +36,40 @@ class BuildTriggerAction extends InvisibleAction implements FoldableAction {
         @CheckForNull
         Throwable interruption;
 
+        /** Where to relay the downstream build's events if it runs on another controller ({@link BuildTriggerRelay}). */
+        @CheckForNull
+        final String returnAddress;
+
         Trigger(StepContext context, boolean propagate, boolean waitForStart) {
+            this(context, propagate, waitForStart, null);
+        }
+
+        Trigger(StepContext context, boolean propagate, boolean waitForStart, @CheckForNull String returnAddress) {
             this.context = context;
             this.propagate = propagate;
             this.waitForStart = waitForStart;
+            this.returnAddress = returnAddress;
+        }
+
+        /**
+         * Relays an event to the step if it runs on another controller.
+         *
+         * @return true if relayed: there is nothing to do here
+         */
+        boolean relayed(Run<?, ?> downstream, BuildTriggerRelay.Event event) {
+            if (returnAddress == null) {
+                return false;
+            }
+            BuildTriggerRelay relay = BuildTriggerRelay.get();
+            if (relay == null) {
+                return false;
+            }
+            try {
+                return relay.relay(returnAddress, waitForStart, downstream, event);
+            } catch (RuntimeException x) {
+                LOGGER.log(Level.WARNING, "Could not relay " + event + " of " + downstream + " to " + returnAddress, x);
+                return false;
+            }
         }
 
     }
@@ -46,8 +77,12 @@ class BuildTriggerAction extends InvisibleAction implements FoldableAction {
     private /* final */ List<Trigger> triggers;
 
     BuildTriggerAction(StepContext context, boolean propagate, boolean waitForStart) {
+        this(context, propagate, waitForStart, null);
+    }
+
+    BuildTriggerAction(StepContext context, boolean propagate, boolean waitForStart, @CheckForNull String returnAddress) {
         triggers = new ArrayList<>();
-        triggers.add(new Trigger(context, propagate, waitForStart));
+        triggers.add(new Trigger(context, propagate, waitForStart, returnAddress));
     }
 
     private Object readResolve() {

@@ -26,6 +26,9 @@ public class BuildTriggerListener extends RunListener<Run<?,?>>{
     @Override
     public void onStarted(Run<?, ?> run, TaskListener listener) {
         for (BuildTriggerAction.Trigger trigger : BuildTriggerAction.triggersFor(run)) {
+            if (trigger.relayed(run, BuildTriggerRelay.Event.STARTED)) {
+                continue;
+            }
             StepContext stepContext = trigger.context;
             if (stepContext != null && stepContext.isReady()) {
                 LOGGER.log(Level.FINE, "started building {0} from #{1} in {2}", new Object[] {run, run.getQueueId(), stepContext});
@@ -50,6 +53,9 @@ public class BuildTriggerListener extends RunListener<Run<?,?>>{
     public void onFinalized(Run<?,?> run) {
         for (BuildTriggerAction.Trigger trigger : BuildTriggerAction.triggersFor(run)) {
             if (!trigger.waitForStart) {
+                if (trigger.relayed(run, BuildTriggerRelay.Event.COMPLETED)) {
+                    continue;
+                }
                 StepContext stepContext = trigger.context;
                 LOGGER.log(Level.FINE, "completing {0} for {1}", new Object[] {run, stepContext});
                 Result result = run.getResult();
@@ -83,6 +89,9 @@ public class BuildTriggerListener extends RunListener<Run<?,?>>{
     @Override
     public void onDeleted(final Run<?,?> run) {
         for (final BuildTriggerAction.Trigger trigger : BuildTriggerAction.triggersFor(run)) {
+            if (trigger.relayed(run, BuildTriggerRelay.Event.DELETED)) {
+                continue;
+            }
             Timer.get().submit(() -> {
                 if (trigger.context.isReady()) {
                     trigger.context.onFailure(new AbortException(run.getFullDisplayName() + " was deleted"));
